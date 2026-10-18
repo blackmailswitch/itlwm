@@ -1079,7 +1079,16 @@ ieee80211_add_rsn_body(u_int8_t *frm, struct ieee80211com *ic,
     /* write RSN Capabilities field */
     rsncaps = (ni->ni_rsncaps & (IEEE80211_RSNCAP_PTKSA_RCNT_MASK |
         IEEE80211_RSNCAP_GTKSA_RCNT_MASK));
-    if (ic->ic_caps & IEEE80211_C_MFP) {
+    /*
+     * As a station only advertise MFP (and the Group Management Cipher
+     * Suite) when the AP supports it too. An RSN IE with MFPC set and an
+     * extra group management cipher is rejected by APs with PMF disabled
+     * (Cisco 3800: Deauth reason 46 right after association).
+     */
+    int mfp = (ic->ic_caps & IEEE80211_C_MFP) &&
+        (ic->ic_opmode != IEEE80211_M_STA ||
+         (ni->ni_flags & IEEE80211_NODE_MFP));
+    if (mfp) {
         rsncaps |= IEEE80211_RSNCAP_MFPC;
         if (ic->ic_flags & IEEE80211_F_MFPR)
             rsncaps |= IEEE80211_RSNCAP_MFPR;
@@ -1096,7 +1105,7 @@ ieee80211_add_rsn_body(u_int8_t *frm, struct ieee80211com *ic,
         frm += IEEE80211_PMKID_LEN;
     }
 
-    if (!(ic->ic_caps & IEEE80211_C_MFP))
+    if (!mfp)
         return frm;
 
     if ((ni->ni_flags & IEEE80211_NODE_PMKID) == 0) {
