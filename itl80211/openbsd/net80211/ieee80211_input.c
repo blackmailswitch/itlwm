@@ -164,6 +164,25 @@ ieee80211_get_hdrlen(const struct ieee80211_frame *wh)
     return size;
 }
 
+/*
+ * 802.11w: Action frame categories that are not "robust" (802.11-2016
+ * 9.4.1.11), i.e. that may be sent unprotected when MFP is in use.
+ */
+static int
+ieee80211_action_is_robust(u_int8_t category)
+{
+    switch (category) {
+    case IEEE80211_CATEG_PUB:
+    case IEEE80211_CATEG_HT:
+    case IEEE80211_CATEG_UNPROT_WNM:
+    case IEEE80211_CATEG_SELF_PROT:
+    case IEEE80211_CATEG_VENDOR:
+        return 0;
+    default:
+        return 1;
+    }
+}
+
 /* Post-processing for drivers which perform decryption in hardware. */
 mbuf_t
 ieee80211_input_hwdecrypt(struct ieee80211com *ic, struct ieee80211_node *ni,
@@ -655,18 +674,39 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
                 if (subtype == IEEE80211_FC0_SUBTYPE_DISASSOC ||
                     subtype == IEEE80211_FC0_SUBTYPE_DEAUTH ||
                     subtype == IEEE80211_FC0_SUBTYPE_ACTION) {
+                    mbuf_t m0 = m;
+                    
                     if (!IEEE80211_IS_MULTICAST(wh->i_addr1) &&
                         !(wh->i_fc[1] & IEEE80211_FC1_PROTECTED)) {
-                        /* unicast mgmt not encrypted */
-                        goto out;
+                        /*
+                         * Unicast mgmt not encrypted: only acceptable
+                         * for non-robust Action frames.
+                         */
+                        if (subtype != IEEE80211_FC0_SUBTYPE_ACTION ||
+                            mbuf_len(m) < sizeof(*wh) + 1 ||
+                            ieee80211_action_is_robust(
+                                ((u_int8_t *)&wh[1])[0])) {
+                            ic->ic_stats.is_rx_unencrypted++;
+                            goto out;
+                        }
+                    } else if (!IEEE80211_IS_MULTICAST(wh->i_addr1) &&
+                               (rxi->rxi_flags & IEEE80211_RXI_HWDEC)) {
+                        /* decrypted by hardware, check PN, strip IV */
+                        m = ieee80211_input_hwdecrypt(ic, ni, m, rxi);
+                        if (m == NULL) {
+                            mbuf_freem(m0);
+                            goto out;
+                        }
+                        wh = mtod(m, struct ieee80211_frame *);
+                    } else {
+                        /* do software decryption (CCMP or BIP) */
+                        m = ieee80211_decrypt(ic, m, ni);
+                        if (m == NULL) {
+                            /* XXX stats */
+                            goto out;
+                        }
+                        wh = mtod(m, struct ieee80211_frame *);
                     }
-                    /* do software decryption */
-                    m = ieee80211_decrypt(ic, m, ni);
-                    if (m == NULL) {
-                        /* XXX stats */
-                        goto out;
-                    }
-                    wh = mtod(m, struct ieee80211_frame *);
                 }
             } else if ((ic->ic_flags & IEEE80211_F_RSNON) &&
                        (wh->i_fc[1] & IEEE80211_FC1_PROTECTED)) {

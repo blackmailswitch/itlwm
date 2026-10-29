@@ -578,6 +578,10 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
         
         /* map PTK to 802.11 key */
         k = &ni->ni_pairwise_key;
+        /* free software crypto context of the previous PTK, if any */
+        if (k->k_cipher == IEEE80211_CIPHER_CCMP &&
+            (k->k_flags & IEEE80211_KEY_SWCRYPTO))
+            ieee80211_ccmp_delete_key(ic, k);
         memset(k, 0, sizeof(*k));
         k->k_cipher = ni->ni_rsncipher;
         k->k_rsc[0] = prsc;
@@ -595,7 +599,8 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
                 goto deauth;
         }
         ni->ni_flags &= ~IEEE80211_NODE_RSN_NEW_PTK;
-        ni->ni_flags &= ~IEEE80211_NODE_TXRXPROT;
+        ni->ni_flags &= ~(IEEE80211_NODE_TXRXPROT |
+            IEEE80211_NODE_TXRXMGMTPROT);
         ni->ni_flags |= IEEE80211_NODE_RXPROT;
     } else if (ni->ni_rsncipher != IEEE80211_CIPHER_USEGROUP)
         XYLog("%s: unexpected pairwise key update received from %s\n",
@@ -675,8 +680,12 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
             }
         }
     }
-    if (info & EAPOL_KEY_INSTALL)
+    if (info & EAPOL_KEY_INSTALL) {
         ni->ni_flags |= IEEE80211_NODE_TXRXPROT;
+        /* 802.11w: PTK and IGTK are installed, protect robust mgmt frames */
+        if (ni->ni_flags & IEEE80211_NODE_MFP)
+            ni->ni_flags |= IEEE80211_NODE_TXRXMGMTPROT;
+    }
     
     if (info & EAPOL_KEY_SECURE) {
         ni->ni_flags |= IEEE80211_NODE_TXRXPROT;

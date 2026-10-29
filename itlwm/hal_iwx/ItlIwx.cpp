@@ -5313,6 +5313,26 @@ iwx_rx_hwdecrypt(struct iwx_softc *sc, mbuf_t m, uint32_t rx_pkt_status,
         return 0;
     
     ni = ieee80211_find_rxnode(ic, wh);
+    if (type == IEEE80211_FC0_TYPE_MGT) {
+        /*
+         * 802.11w: protected unicast robust management frames. The
+         * firmware may or may not have decrypted them. If it did not,
+         * leave the frame untouched and let net80211 decrypt it in
+         * software. Never drop here; net80211 applies the MFP rules.
+         */
+        if ((wh->i_fc[1] & IEEE80211_FC1_PROTECTED) &&
+            !IEEE80211_IS_MULTICAST(wh->i_addr1) &&
+            (ni->ni_flags & IEEE80211_NODE_RXMGMTPROT) &&
+            ni->ni_rsncipher == IEEE80211_CIPHER_CCMP &&
+            (rx_pkt_status & IWX_RX_MPDU_RES_STATUS_SEC_ENC_MSK) ==
+            IWX_RX_MPDU_RES_STATUS_SEC_CCM_ENC &&
+            (rx_pkt_status & (IWX_RX_MPDU_RES_STATUS_DEC_DONE |
+                              IWX_RX_MPDU_RES_STATUS_MIC_OK)) ==
+            (IWX_RX_MPDU_RES_STATUS_DEC_DONE |
+             IWX_RX_MPDU_RES_STATUS_MIC_OK))
+            rxi->rxi_flags |= IEEE80211_RXI_HWDEC;
+        goto out;
+    }
     /* Handle hardware decryption. */
     if (((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) != IEEE80211_FC0_TYPE_CTL)
         && (wh->i_fc[1] & IEEE80211_FC1_PROTECTED) &&
@@ -5363,6 +5383,7 @@ iwx_rx_frame(struct iwx_softc *sc, mbuf_t m, int chanidx,
     wh = mtod(m, struct ieee80211_frame *);
     ni = ieee80211_find_rxnode(ic, wh);
     if ((rxi->rxi_flags & IEEE80211_RXI_HWDEC) &&
+        (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) != IEEE80211_FC0_TYPE_MGT &&
         iwx_ccmp_decap(sc, m, ni, rxi) != 0) {
         ifp->netStat->inputErrors++;
         mbuf_freem(m);
@@ -7061,7 +7082,14 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
     
     if (wh->i_fc[1] & IEEE80211_FC1_PROTECTED) {
         k = ieee80211_get_txkey(ic, wh, ni);
-        if (k->k_cipher != IEEE80211_CIPHER_CCMP) {
+        /*
+         * Protected management frames (802.11w) are always encrypted in
+         * software: unicast ones with CCMP (using the PTK context kept by
+         * net80211), group addressed ones with BIP.
+         */
+        if (k->k_cipher != IEEE80211_CIPHER_CCMP ||
+            (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) ==
+            IEEE80211_FC0_TYPE_MGT) {
             if ((m = ieee80211_encrypt(ic, m, k)) == NULL)
                 return ENOBUFS;
             /* 802.11 header may have moved. */
@@ -7483,7 +7511,12 @@ iwx_add_sta_cmd(struct iwx_softc *sc, struct iwx_node *in, int update)
     add_sta_cmd.add_modify = update ? 1 : 0;
     add_sta_cmd.station_flags_msk
     |= htole32(IWX_STA_FLG_FAT_EN_MSK | IWX_STA_FLG_MIMO_EN_MSK);
-    /* Let the firmware encrypt/decrypt robust unicast management frames. */
+    /*
+     * Tell the firmware that MFP is in use. The firmware may then decrypt
+     * robust unicast management frames itself; the driver handles both that
+     * and the software decryption case (see iwx_rx_hwdecrypt()). Outgoing
+     * robust management frames are always encrypted in software (iwx_tx()).
+     */
     add_sta_cmd.station_flags_msk |= htole32(IWX_STA_FLG_MFP_EN);
     if (in->in_ni.ni_flags & IEEE80211_NODE_MFP)
         add_sta_cmd.station_flags |= htole32(IWX_STA_FLG_MFP_EN);
@@ -10052,6 +10085,19 @@ iwx_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
         return (ieee80211_set_key(ic, ni, k));
     }
     
+    /*
+     * With 802.11w, unicast management frames are CCMP encrypted and
+     * decrypted in software, so net80211 needs its own context for the PTK
+     * (this also sets IEEE80211_KEY_SWCRYPTO). Data frames still use the
+     * key programmed into the firmware below.
+     */
+    if (!(k->k_flags & IEEE80211_KEY_GROUP) &&
+        (ni->ni_flags & IEEE80211_NODE_MFP)) {
+        int error = ieee80211_set_key(ic, ni, k);
+        if (error != 0)
+            return error;
+    }
+    
     memset(&cmd, 0, sizeof(cmd));
     
     cmd.common.key_flags = htole16(IWX_STA_KEY_FLG_CCM |
@@ -10101,6 +10147,12 @@ iwx_delete_key(struct ieee80211com *ic, struct ieee80211_node *ni,
     cmd.common.sta_id = IWX_STATION_ID;
     
     that->iwx_send_cmd_pdu(sc, IWX_ADD_STA_KEY, IWX_CMD_ASYNC, sizeof(cmd), &cmd);
+    
+    /* release the software crypto context used for management frames */
+    if (k->k_flags & IEEE80211_KEY_SWCRYPTO) {
+        ieee80211_ccmp_delete_key(ic, k);
+        k->k_flags &= ~IEEE80211_KEY_SWCRYPTO;
+    }
 }
 
 int ItlIwx::
